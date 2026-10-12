@@ -2,20 +2,18 @@ import type { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { Chat, type IChat, type IChatObject } from '../db/models/Chat.js';
 import { Message, type IMessage } from '../db/models/Message.js';
+import type { GetChatByIdParams } from '../schemas/chatSchema.js';
 
-export interface GetChatByIdParams {
-  id: string;
-}
 
 export interface ErrorResponse {
   message: string;
   error?: string;
 }
 
-export interface ChatWithMessages extends IChatObject {
+export interface ChatByIdResponse {
+  chat: IChat;
   messages: IMessage[];
 }
-
 /**
  * GET /api/chats
  * Returns all chats sorted by most recent (updatedAt descending)
@@ -42,15 +40,10 @@ export const getChats = async (
  */
 export const getChatById = async (
   req: Request<GetChatByIdParams>,
-  res: Response<ChatWithMessages | ErrorResponse>
+  res: Response<ChatByIdResponse | ErrorResponse>
 ): Promise<void> => {
   try {
     const { id } = req.params;
-
-    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-      res.status(400).json({ message: 'Invalid chat ID format' });
-      return;
-    }
 
     const chat = await Chat.findById(id);
     if (!chat) {
@@ -60,10 +53,8 @@ export const getChatById = async (
 
     const messages = await Message.find({ chatId: id }).sort({ createdAt: 1 });
 
-    const chatObj = chat.toObject() as IChatObject;
-
     res.status(200).json({
-      ...chatObj,
+      chat,
       messages,
     });
   } catch (error) {
@@ -74,6 +65,3 @@ export const getChatById = async (
     });
   }
 };
-
-export const getAllChats = getChats;
-export default { getChats, getAllChats, getChatById };
