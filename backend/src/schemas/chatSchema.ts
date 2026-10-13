@@ -10,6 +10,7 @@ export type GetChatByIdParams = z.infer<typeof getChatByIdSchema>;
 export const createChatSchema = z.object({
   title: z
     .string()
+    .trim()
     .min(1, 'Title cannot be empty')
     .max(100, 'Title cannot exceed 100 characters')
     .optional()
@@ -29,9 +30,9 @@ export type UpdateChatParams = z.infer<typeof updateChatParamsSchema>;
 export const updateChatBodySchema = z.object({
   title: z
     .string()
+    .trim()
     .min(1, 'Title cannot be empty')
     .max(100, 'Title cannot exceed 100 characters')
-    .optional(),
 });
 
 // Infer the type for TypeScript

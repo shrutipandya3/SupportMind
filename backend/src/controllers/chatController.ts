@@ -9,11 +9,6 @@ export interface ErrorResponse {
   error?: string;
 }
 
-export interface ChatByIdResponse {
-  chat: IChat;
-  messages: IMessage[];
-}
-
 export interface GetChatsResponse {
   chats: IChatObject[];
 }
@@ -36,6 +31,12 @@ export const getChats = async (
     });
   }
 };
+
+
+export interface ChatByIdResponse {
+  chat: IChat;
+  messages: IMessage[];
+}
 
 /**
  * GET /api/chats/:id

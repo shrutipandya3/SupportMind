@@ -1,5 +1,5 @@
 import { type NextFunction, type Request, type Response } from 'express';
-import { type ZodType  } from 'zod';
+import { ZodError, type ZodType } from 'zod';
 
 type ValidationOptions = { body?: ZodType; params?: ZodType; query?: ZodType };
 
@@ -28,10 +28,21 @@ export const validate = (schemas: ValidationOptions) => {
 
       next();
     } catch (error) {
+      // Invalid client input -> 400
+      if (error instanceof ZodError) {
+        res.status(400).json({
+          message: 'Validation failed',
+          error: error.issues.map((issue) => issue.message).join(', '),
+        });
+        return;
+      }
+
+      // Anything else is unexpected -> 500
+      console.error('Unexpected error in validate middleware:', error);
       res.status(500).json({
-      message: 'Failed to fetch chat',
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });  
+        message: 'Internal server error',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
     }
   };
 };
