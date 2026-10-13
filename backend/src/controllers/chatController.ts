@@ -1,5 +1,4 @@
 import type { Request, Response } from 'express';
-import mongoose from 'mongoose';
 import { Chat, type IChat, type IChatObject } from '../db/models/Chat.js';
 import { Message, type IMessage } from '../db/models/Message.js';
 import type { GetChatByIdParams } from '../schemas/chatSchema.js';
@@ -14,17 +13,21 @@ export interface ChatByIdResponse {
   chat: IChat;
   messages: IMessage[];
 }
+
+export interface GetChatsResponse {
+  chats: IChatObject[];
+}
 /**
  * GET /api/chats
  * Returns all chats sorted by most recent (updatedAt descending)
  */
 export const getChats = async (
   _req: Request,
-  res: Response<IChat[] | ErrorResponse>
+  res: Response<GetChatsResponse | ErrorResponse>
 ): Promise<void> => {
   try {
     const chats = await Chat.find().sort({ updatedAt: -1 });
-    res.status(200).json(chats);
+    res.status(200).json({chats});
   } catch (error) {
     console.error('Error fetching chats:', error);
     res.status(500).json({
@@ -61,6 +64,82 @@ export const getChatById = async (
     console.error('Error fetching chat by ID:', error);
     res.status(500).json({
       message: 'Failed to fetch chat',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+};
+
+export interface CreateChatResponse {
+  chat: IChat;
+}
+
+/**
+- POST /api/chats
+- Creates a new chat with a default title
+ */
+export const createChat = async (
+  req: Request<{}, CreateChatResponse | ErrorResponse>,
+  res: Response<CreateChatResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    // You can also extract an optional custom title from req.body if needed, 
+    // falling back to 'New Chat'.
+    const title = req.body.title || 'New Chat';
+
+    const chat = new Chat({
+      title,
+    });
+
+    await chat.save();
+
+    res.status(201).json({
+      chat,
+    });
+  } catch (error) {
+    console.error('Error creating chat:', error);
+    res.status(500).json({
+      message: 'Failed to create chat',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+};
+
+export interface UpdateChatResponse {
+  chat: IChat;
+}
+
+/**
+ - PATCH /api/chats/:id
+ - Updates an existing chat's title
+ */
+export const updateChatTitle = async (
+  req: Request<{ id: string }, UpdateChatResponse | ErrorResponse, { title?: string }>,
+  res: Response<UpdateChatResponse | ErrorResponse>
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { title } = req.body;
+
+    const chat = await Chat.findByIdAndUpdate(
+      id,
+      { title: title?.trim() },
+      { new: true, runValidators: true }
+    );
+
+    if (!chat) {
+      res.status(404).json({
+        message: 'Chat not found',
+      });
+      return;
+    }
+
+    res.status(200).json({
+      chat,
+    });
+  } catch (error) {
+    console.error('Error updating chat title:', error);
+    res.status(500).json({
+      message: 'Failed to update chat title',
       error: error instanceof Error ? error.message : 'Unknown error',
     });
   }
