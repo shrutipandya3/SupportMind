@@ -4,8 +4,7 @@ import mongoose from 'mongoose';
 import Chat from '../../db/models/Chat.js';
 import Message from '../../db/models/Message.js';
 import app from '../../app.js';
-
-const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db';
+import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
 
 /**
  * Helpers: insert via the raw collection so Mongoose timestamps
@@ -43,12 +42,12 @@ describe('GET /api/chats/:id', () => {
   beforeAll(async () => {
     // Connect only if the app didn't already do it
     if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(TEST_DB_URI);
+      await dbConnect();
     }
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
+    await dbDisconnect();
   });
 
   beforeEach(async () => {

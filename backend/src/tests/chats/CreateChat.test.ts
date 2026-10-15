@@ -3,8 +3,7 @@ import request from 'supertest';
 import mongoose from 'mongoose';
 import Chat from '../../db/models/Chat.js';
 import app from '../../app.js';
-
-const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db';
+import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
 
 /**
  * NOTE: these tests assume the schema is:
@@ -34,15 +33,9 @@ const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db'
  */
 
 describe('POST /api/chats', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(TEST_DB_URI);
-    }
-  });
+  beforeAll(async () => await dbConnect());
 
-  afterAll(async () => {
-    await mongoose.disconnect();
-  });
+  afterAll(async () => await dbDisconnect());
 
   beforeEach(async () => {
     await Chat.deleteMany({});

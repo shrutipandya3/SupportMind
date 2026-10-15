@@ -10,10 +10,10 @@
     "start": "node dist/index.js",
     "seed": "tsx src/db/seed.ts",
     "reset-db": "tsx src/db/resetTestdb.ts",
-    "test": "cross-env NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/test_db NODE_OPTIONS=--experimental-vm-modules jest --runInBand",
-    "test:watch": "cross-env NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/test_db NODE_OPTIONS=--experimental-vm-modules jest --watch",
-    "test:coverage": "cross-env NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/test_db NODE_OPTIONS=--experimental-vm-modules jest --coverage",
-    "test:ci": "cross-env NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/test_db NODE_OPTIONS=--experimental-vm-modules jest --ci"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --coverage",
+    "test:ci": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --ci"
   },
   "keywords": [],
   "author": "",
@@ -24,6 +24,7 @@
     "express": "^5.2.1",
     "http-status-codes": "^2.3.0",
     "mongodb": "^7.7.0",
+    "mongodb-memory-server": "^11.3.0",
     "mongoose": "^9.11.1",
     "zod": "^4.6.6"
   },

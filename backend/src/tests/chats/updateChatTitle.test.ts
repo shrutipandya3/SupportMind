@@ -3,8 +3,7 @@ import request from 'supertest';
 import mongoose from 'mongoose';
 import Chat from '../../db/models/Chat.js';
 import app from '../../app.js';
-
-const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db';
+import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
 
 /**
  * NOTE: these tests assume the schemas are:
@@ -39,13 +38,11 @@ const validObjectId = () => new mongoose.Types.ObjectId().toString();
 describe('PATCH /api/chats/:id', () => {
   beforeAll(async () => {
     if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(TEST_DB_URI);
+      await dbConnect();
     }
   });
 
-  afterAll(async () => {
-    await mongoose.disconnect();
-  });
+  afterAll(async () => await dbDisconnect());
 
   beforeEach(async () => {
     await Chat.deleteMany({});
@@ -376,7 +373,7 @@ describe('PATCH /api/chats/:id', () => {
       expect(res.body.chat.foo).toBeUndefined();
     });
 
-    it('calls findByIdAndUpdate with the trimmed title and { new: true, runValidators: true }', async () => {
+    it('calls findByIdAndUpdate with the trimmed title and { returnDocument: "after", runValidators: true }', async () => {
       const chat = await Chat.create({ title: 'Original' });
       const updateSpy = jest.spyOn(Chat, 'findByIdAndUpdate');
 
@@ -388,7 +385,7 @@ describe('PATCH /api/chats/:id', () => {
       expect(updateSpy).toHaveBeenCalledWith(
         chat._id.toString(),
         { title: 'Spy Title' },
-        { new: true, runValidators: true }
+        { returnDocument: 'after', runValidators: true }
       );
     });
   });

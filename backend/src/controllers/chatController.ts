@@ -124,7 +124,7 @@ export const updateChatTitle = async (
     const chat = await Chat.findByIdAndUpdate(
       id,
       { title: title?.trim() },
-      { new: true, runValidators: true }
+      { returnDocument: 'after', runValidators: true }
     );
 
     if (!chat) {

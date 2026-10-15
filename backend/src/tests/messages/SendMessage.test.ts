@@ -7,8 +7,8 @@ import mongoose from 'mongoose';
 import Chat from '../../db/models/Chat.js';
 import Message from '../../db/models/Message.js';
 import app from '../../app.js';
+import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
 
-const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db';
 
 /**
  * NOTE: these tests assume:
@@ -87,12 +87,12 @@ const contentChunks = (events: ParsedSSE[]): string[] =>
 describe('POST /api/chats/:id/messages', () => {
   beforeAll(async () => {
     if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(TEST_DB_URI);
+      await dbConnect();
     }
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
+    await dbDisconnect()
   });
 
   beforeEach(async () => {

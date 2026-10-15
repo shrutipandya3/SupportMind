@@ -3,21 +3,19 @@ import request from 'supertest';
 import mongoose from 'mongoose';
 import Chat from '../../db/models/Chat.js';
 import app from '../../app.js';
+import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
 
 
-const TEST_DB_URI = process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/test_db';
 
 describe('GET /api/chats', () => {
   beforeAll(async () => {
     // Connect only if the app didn't already do it
     if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(TEST_DB_URI);
+      await dbConnect();
     }
   });
 
-  afterAll(async () => {
-    await mongoose.disconnect();
-  });
+  afterAll(async () => await dbDisconnect());
 
   beforeEach(async () => {
     await Chat.deleteMany({}); // each test starts from a clean collection
