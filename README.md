@@ -1,159 +1,184 @@
-# Turborepo starter
+# SupportMind
 
-This Turborepo starter is maintained by the Turborepo core team.
+An AI customer-support agent for an electronics store. SupportMind answers questions about products, return policies, payment methods and delivery rules. It pulls live data (price, stock, specs) from MongoDB and answers from uploaded manuals and policy PDFs using hybrid search (semantic + BM25). When it can't help, it creates a ticket for a human.
 
-## Using this example
+## Motivation
 
-Run the following command:
+This project was built to learn how to build a production-style AI agent end to end: tool calling with **MCP (Model Context Protocol)**, retrieval-augmented generation (RAG) over PDFs, multi-turn chat, guardrails, and caching. Every data source the bot touches is exposed to the model as an MCP tool.
 
-```sh
-npx create-turbo@latest
+## Table of contents
+
+1. [What it does](#what-it-does)
+2. [Tech stack](#tech-stack)
+3. [Architecture](#architecture)
+4. [Monorepo structure](#monorepo-structure)
+5. [Request workflow](#request-workflow)
+6. [RAG pipeline](#rag-pipeline)
+7. [Guardrails and rate limiting](#guardrails-and-rate-limiting)
+8. [Caching](#caching)
+9. [Admin dashboard](#admin-dashboard)
+10. [Getting started](#getting-started)
+11. [Future roadmap](#future-roadmap)
+
+---
+
+## What it does
+
+- Customers chat with the bot anonymously (no login), with streaming replies.
+- Answers FAQ questions (return policy, payment methods, delivery rules) from policy PDFs, with citations.
+- Answers product questions (search, details, comparison, price, stock) using live data from MongoDB.
+- Answers manual questions from uploaded product manuals.
+- Creates a ticket for a human when it can't answer or the user asks for a person.
+- Gives admins a dashboard to manage products, upload PDFs, handle tickets and view usage analytics.
+
+**Catalog:** 20–30 electronics products across 4–5 categories. Each category has its own attributes (laptops: RAM, storage, screen size; headphones: battery life, noise cancelling).
+
+---
+
+## Tech stack
+
+| Layer | Choice |
+|---|---|
+| Language | TypeScript everywhere |
+| Backend | Node.js, Express, dotenv, Mongoose |
+| Database | MongoDB |
+| Vector search | MongoDB Atlas Vector Search |
+| Lexical search | BM25 via Atlas Search |
+| Frontend | React, React Router, MUI |
+| LLM | Anthropic Claude via API |
+| Embeddings | Third-party embedding model (set in env) |
+| Tools layer | MCP server (official TypeScript SDK) |
+| Rate limits and cache | Redis |
+| Background jobs | Redis-backed queue (PDF ingestion) |
+
+---
+
+## Architecture
+
+```
+                    ┌──────────────────────┐
+                    │  React frontend      │
+                    │  (chat + admin)      │
+                    └──────────┬───────────┘
+                               │ HTTPS + SSE streaming
+                    ┌──────────▼───────────┐
+                    │  Express API         │
+                    │  auth, rate limits,  │
+                    │  guardrails          │
+                    └───┬──────────────┬───┘
+                        │              │
+          LLM calls     │              │  MCP client
+     ┌──────────────────▼──┐      ┌────▼─────────────────────┐
+     │  Claude API         │      │  MCP server              │
+     │  (tool-calling loop)│      │  product, manual, policy │
+     └─────────────────────┘      │  search tools,           │
+                                  │  create_ticket           │
+                                  └────┬───────────────┬─────┘
+                                       │               │
+                              ┌────────▼───┐    ┌──────▼────────┐
+                              │  MongoDB   │    │ Vector + BM25 │
+                              │  products, │    │ index (chunks)│
+                              │  chats,    │    └───────────────┘
+                              │  tickets   │
+                              └────────────┘      Redis: rate limits, response cache, job queue
 ```
 
-## What's inside?
+The Express backend acts as the MCP client. The MCP server is a separate process that exposes product, manual and policy search plus ticket creation. The chatbot only gets read tools and `create_ticket`, never admin operations.
 
-This Turborepo includes the following packages/apps:
+---
 
-### Apps and Packages
+## Monorepo structure
 
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `@next/eslint-plugin-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```
+supportmind/
+├── backend/        # Express API, workflow, services, ingestion worker
+├── mcp-server/     # MCP tools
+├── frontend/       # React app (chat + admin screens)
+├── shared/         # Shared TypeScript types
+├── seed/           # Sample products, PDFs, admin seed script
+└── README.md
 ```
 
-Without global `turbo`, use your package manager:
+---
 
-```sh
-cd my-turborepo
-npx turbo build
-pnpm exec turbo build
-pnpm exec turbo build
-```
+## Request workflow
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+1. **Input guardrails:** length cap and prompt-injection checks.
+2. **Simple reply check:** greetings and thanks are matched with basic keyword matching and answered with a fixed reply, without calling the model.
+3. **Model-driven tool calling:** the model reads the conversation history and decides which tools to call (product search, manual search, policy search, ticket creation), including several tools in one turn. The loop has an iteration cap and tool timeouts.
+4. **Output guardrails:** checks the reply before it is shown to the user.
+5. **Save and log:** the reply is saved with citations, token usage is logged, and a ticket is created if needed.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+**A ticket is created when** the user asks for a human, nothing relevant is found, or a tool fails.
 
-```sh
-turbo build --filter=docs
-```
+---
 
-Without global `turbo`:
+## RAG pipeline
 
-```sh
-npx turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-```
+Runs as a background job when an admin uploads a PDF. The document status updates as it goes, and the job can be re-run.
 
-### Develop
+**Retrieval:** run semantic and BM25 searches in parallel, merge with Reciprocal Rank Fusion, return the top chunks with source and page for citations. A reranker can be added if quality needs it.
 
-To develop all apps and packages, run the following command:
+**Updates:** deleting or re-uploading a document removes the old chunks and bumps the document version, which also invalidates cached answers.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+---
 
-```sh
-cd my-turborepo
-turbo dev
-```
+## Guardrails and rate limiting
 
-Without global `turbo`, use your package manager:
+- **Rate limiting:** limits how many messages and how many tokens a user can use in a given period, and caps overall usage, so the bot can't be spammed or run up costs. Users are identified by their session (plus IP for anonymous visitors).
+- **Input guardrails:** block oversized input and prompt-injection attempts before they reach the model.
+- **Output guardrails:** stop the bot from leaking its system prompt, going off-topic, or stating prices and stock that don't match the data.
 
-```sh
-cd my-turborepo
-npx turbo dev
-pnpm exec turbo dev
-pnpm exec turbo dev
-```
+---
 
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+## Caching
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+- **Prompt caching (provider):** the stable part of every request (system prompt and tool definitions) is cached by the model provider, so repeated calls are faster and cheaper.
+- **Response caching:** answers to repeated policy and manual questions are stored in Redis and returned without calling the model. Cache entries are tied to the document version, so uploading, editing or deleting a PDF automatically invalidates stale answers. Price and stock answers are never cached.
 
-```sh
-turbo dev --filter=web
-```
+---
 
-Without global `turbo`:
+## Admin dashboard
 
-```sh
-npx turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-```
+- Login only; the admin user is created by a seed script.
+- Product management, PDF upload and processing status, tickets, and analytics (tokens used, success rate, ticket counts).
 
-### Remote Caching
+---
 
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
+## Getting started
 
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
+**Prerequisites:** Node.js 20+, MongoDB (Atlas for vector search), Redis, an Anthropic API key, an embeddings provider key.
 
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
+**Environment variables (backend)**
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+| Variable | Purpose |
+|---|---|
+| `PORT` | API port |
+| `MONGODB_URI` | MongoDB connection string |
+| `REDIS_URL` | Redis connection string |
+| `ANTHROPIC_API_KEY` | LLM API key (server-side only) |
+| `LLM_MODEL` | Model name |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_API_KEY` | Embeddings |
+| `JWT_SECRET` | Admin auth |
+| `ALLOWED_ORIGINS` | CORS |
+| `MCP_SERVER_COMMAND` or `MCP_SERVER_URL` | How the backend reaches the MCP server |
 
-```sh
-cd my-turborepo
-turbo login
-```
+**Setup**
+1. Install dependencies in each workspace (`backend`, `mcp-server`, `frontend`, `shared`).
+2. Copy the example env file and fill it in.
+3. Run the seed script to create the admin user, products and sample PDFs.
+4. Start MongoDB and Redis, then the backend, MCP server and frontend.
 
-Without global `turbo`, use your package manager:
+---
 
-```sh
-cd my-turborepo
-npx turbo login
-pnpm exec turbo login
-pnpm exec turbo login
-```
+## Future roadmap
 
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-pnpm exec turbo link
-pnpm exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+1. **Customer accounts and orders.** Customer authentication and an orders collection.
+2. **Order tracking.** Live order status from an orders API.
+3. **Refunds and returns.** Write actions with safeguards: user confirmation, authorization checks, idempotency and audit logs.
+4. **Human escalation for complex or emotional conversations.**
+5. **Product images.** Image fields on products, returned in chat replies.
+6. **Intent router.** Route each message by intent to handle hardcoded replies (greetings, thanks, "track my order") and to decide what is cacheable, instead of relying on the model for everything.
+7. **Reranker and OCR.** Rerank retrieval results and support scanned PDFs.
+8. **Multi-server MCP.** Split into separate catalog and support servers.
+9. **Scaling.** Stateless servers, Redis-backed limits and cache, and a job queue for ingestion to support thousands of users.
