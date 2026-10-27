@@ -1,7 +1,5 @@
 import {
-  Alert,
   Box,
-  Button,
   CircularProgress,
   List,
   ListItemButton,
@@ -14,7 +12,7 @@ import { useChats } from '../../hooks/useChat';
 export default function ChatHistoryList() {
   // Active chat = the one in the URL. On "/" nothing matches, so nothing is active.
   const activeId = useMatch('/chat/:id')?.params.id;
-  const { data: chats, isLoading, isError, error, refetch } = useChats();
+  const { data: chats, isLoading, isError } = useChats();
 
   if (isLoading) {
     return (
@@ -25,18 +23,12 @@ export default function ChatHistoryList() {
   }
 
   if (isError) {
+    // Don't show a scary error — just render as if there are no chats yet.
+    // The real error is logged; users can start a new chat normally.
     return (
-      <Alert
-        severity="error"
-        sx={{ m: 2 }}
-        action={
-          <Button color="inherit" size="small" onClick={() => refetch()}>
-            Retry
-          </Button>
-        }
-      >
-        {error.message}
-      </Alert>
+      <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+        No chats yet.
+      </Typography>
     );
   }
 

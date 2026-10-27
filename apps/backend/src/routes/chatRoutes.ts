@@ -1,24 +1,25 @@
 import { Router } from 'express';
-import { createChat, getChatById, getChats, updateChatTitle } from '../controllers/chatController.js';
+import { createChat, getChatById, getChats, updateChat } from '../controllers/chatController.js';
 import { validate } from '../middleware/validate.js';
 import { createChatSchema, getChatByIdSchema, updateChatBodySchema, updateChatParamsSchema } from '../schemas/chatSchema.js';
+import { ensureSession, optionalSession, requireSession } from '../middleware/session.js';
 
-const router = Router();
+const router: Router = Router();
 
 // GET /api/chats - returns all chats sorted by most recent
-router.get('/', getChats);
+router.get('/', optionalSession, getChats);
 
 // GET /api/chats/:id - returns the chat and its messages
-router.get('/:id', validate({ params: getChatByIdSchema }), getChatById);
+router.get('/:id', requireSession, validate({ params: getChatByIdSchema }), getChatById);
 
 // POST /api/chats - creates a new chat
-router.post('/', validate({ body: createChatSchema }), createChat);
+router.post('/', ensureSession, validate({ body: createChatSchema }), createChat);
 
 // PATCH /api/chats/:id - updates an existing chat's title
 router.patch(
   '/:id',
-  validate({ params: updateChatParamsSchema, body: updateChatBodySchema }),
-  updateChatTitle
+  requireSession, validate({ params: updateChatParamsSchema, body: updateChatBodySchema }),
+  updateChat
 );
 
 export default router;

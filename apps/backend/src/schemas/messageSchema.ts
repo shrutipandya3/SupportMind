@@ -1,12 +1,16 @@
 import { z } from 'zod';
 
-export const sendMessageParamsSchema = z.object({
-  id: z.string().regex(/^[0-9a-fA-F]{24}$/, 'Invalid chat ID format'),
-});
+const objectIdSchema = z.string().regex(/^[0-9a-fA-F]{24}$/, 'Invalid chat ID format');
 
-// Infer the type for TypeScript
+export const sendMessageParamsSchema = z.object({
+  id: objectIdSchema,
+});
 export type SendMessageParams = z.infer<typeof sendMessageParamsSchema>;
 
+/**
+ * Only `content` is accepted from the client. role, status, replyType, sources,
+ * toolCalls, model, guardrailFlag, errorMessage and feedback are set by the server.
+ */
 export const sendMessageBodySchema = z.object({
   content: z
     .string()
@@ -14,6 +18,4 @@ export const sendMessageBodySchema = z.object({
     .min(1, 'Message cannot be empty')
     .max(4000, 'Message cannot exceed 4000 characters'),
 });
-
-// Infer the type for TypeScript
 export type SendMessageBody = z.infer<typeof sendMessageBodySchema>;

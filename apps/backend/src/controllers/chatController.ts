@@ -1,29 +1,44 @@
 import type { NextFunction, Request, Response } from 'express';
 import { Chat, type IChat, type IChatObject } from '../db/models/Chat.js';
-import { Message, type IMessage } from '../db/models/Message.js';
+import { Message, type IMessageObject } from '../db/models/Message.js';
 import type {
   CreateChatBody,
   GetChatByIdParams,
+  GetChatsQuery,
   UpdateChatBody,
   UpdateChatParams,
 } from '../schemas/chatSchema.js';
 import { createHttpError } from '../middleware/errorHandler.js';
+import { getSessionId } from '../middleware/session.js';
 
 export interface GetChatsResponse {
   chats: IChatObject[];
 }
 
 /**
- * GET /api/chats
- * Returns all chats sorted by most recent (updatedAt descending)
+ * GET /api/chats?status=active|archived
+ * Returns the current session's chats (default: active), most recent first
  */
 export const getChats = async (
-  _req: Request,
+  req: Request<{}, GetChatsResponse, {}, GetChatsQuery>,
   res: Response<GetChatsResponse>,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const chats = await Chat.find().sort({ updatedAt: -1 });
+    // No session cookie yet → visitor hasn't started a chat; return empty list.
+    if (!req.sessionId) {
+      res.status(200).json({ chats: [] });
+      return;
+    }
+
+    const sessionId = req.sessionId;
+    const status = req.query.status ?? 'active';
+
+    // Uses the { sessionId: 1, updatedAt: -1 } index
+    const chats = await Chat.find({ sessionId, status })
+      .sort({ updatedAt: -1 })
+      .lean<IChatObject[]>();
+
     res.status(200).json({ chats });
   } catch (error) {
     next(error);
@@ -31,8 +46,8 @@ export const getChats = async (
 };
 
 export interface ChatByIdResponse {
-  chat: IChat;
-  messages: IMessage[];
+  chat: IChatObject;
+  messages: IMessageObject[];
 }
 
 /**
@@ -46,14 +61,19 @@ export const getChatById = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
+    const sessionId = getSessionId(req);
 
-    const chat = await Chat.findById(id);
+    // Scoped to session: other sessions' chats are indistinguishable from missing
+    const chat = await Chat.findOne({ _id: id, sessionId }).lean<IChatObject>();
     if (!chat) {
       next(createHttpError(404, 'Chat not found'));
       return;
     }
 
-    const messages = await Message.find({ chatId: id }).sort({ createdAt: 1 });
+    // Uses the { chatId: 1, createdAt: 1 } index
+    const messages = await Message.find({ chatId: chat._id })
+      .sort({ createdAt: 1 })
+      .lean<IMessageObject[]>();
 
     res.status(200).json({ chat, messages });
   } catch (error) {
@@ -67,7 +87,7 @@ export interface CreateChatResponse {
 
 /**
  * POST /api/chats
- * Creates a new chat (defaults to the title 'New Chat')
+ * Creates a new chat (title defaults to 'New chat', status to 'active')
  */
 export const createChat = async (
   req: Request<{}, CreateChatResponse, CreateChatBody>,
@@ -75,9 +95,10 @@ export const createChat = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const title = req.body.title || 'New Chat';
+    const sessionId = getSessionId(req); // set by ensureSession (new or existing)
 
-    const chat = new Chat({ title });
+    // If title is undefined, the model default ('New chat') applies
+    const chat = new Chat({ title: req.body.title, sessionId });
     await chat.save();
 
     res.status(201).json({ chat });
@@ -87,27 +108,32 @@ export const createChat = async (
 };
 
 export interface UpdateChatResponse {
-  chat: IChat;
+  chat: IChatObject;
 }
 
 /**
  * PATCH /api/chats/:id
- * Updates an existing chat's title
+ * Updates an existing chat's title and/or status (archive / unarchive)
  */
-export const updateChatTitle = async (
+export const updateChat = async (
   req: Request<UpdateChatParams, UpdateChatResponse, UpdateChatBody>,
   res: Response<UpdateChatResponse>,
   next: NextFunction
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { title } = req.body;
+    const { title, status } = req.body;
+    const sessionId = getSessionId(req);
 
-    const chat = await Chat.findByIdAndUpdate(
-      id,
-      { title: title.trim() },
-      { returnDocument: 'after', runValidators: true }
-    );
+    // Build the update explicitly so nothing else can be changed through this route
+    const update: Partial<Pick<IChat, 'title' | 'status'>> = {};
+    if (title !== undefined) update.title = title.trim();
+    if (status !== undefined) update.status = status;
+
+    const chat = await Chat.findOneAndUpdate({ _id: id, sessionId }, update, {
+      returnDocument: 'after',
+      runValidators: true,
+    }).lean<IChatObject>();
 
     if (!chat) {
       next(createHttpError(404, 'Chat not found'));
