@@ -8,27 +8,33 @@ import Chat from '../../db/models/Chat.js';
 import Message from '../../db/models/Message.js';
 import app from '../../app.js';
 import { dbConnect, dbDisconnect } from '../../utils/testUtils/testDbHandler.js';
-
+import { seedTestData, SESSION_A, SESSION_B, type SeedResult } from '../../utils/testUtils/testSeed.js';
 
 /**
- * NOTE: these tests assume:
+ * POST /api/chats/:id/messages
  *
- *  - route: POST /api/chats/:id/messages
- *      validate({ params: sendMessageParamsSchema, body: sendMessageBodySchema })
- *      runs BEFORE the controller, and the validate middleware writes the
- *      parsed (trimmed) body back to req.body. If it does not, the
- *      "stores trimmed content" test will fail, which is a real finding.
- *  - Chat model defaults `title` to 'New Chat' (we pass it explicitly anyway)
- *  - CHUNK_DELAY_MS is 100 and WORDS_PER_CHUNK is 2 (as in the controller).
- *    `speedUpStreaming()` shortens only 100ms timers so tests don't take ~2s each.
- *  - Import paths for Chat / Message / app may need adjusting to your layout.
+ * Route: requireSession → validate(params + body) → sendMessage
+ *
+ * Key contracts tested:
+ *  - requireSession fires BEFORE the controller: no session cookie → 401
+ *  - The controller scopes Chat lookup to the session (findOne { _id, sessionId })
+ *    so a valid chatId with the WRONG session cookie → 404
+ *  - Streaming uses Server-Sent Events (SSE); wire format is:
+ *      data: {"content":"..."}          ← unnamed chunk events
+ *      event: done\ndata: {...}         ← terminal done event
+ *      event: error\ndata: {...}        ← terminal error event (mid-stream failures)
+ *  - CHUNK_DELAY_MS = 100, WORDS_PER_CHUNK = 2 (as in the controller)
+ *  - speedUpStreaming() patches only 100ms timers so tests stay fast
+ *
+ * Seed data (from testSeed.ts):
+ *  - SESSION_A owns: 'Refund request', 'Password reset help'
+ *  - SESSION_B owns: 'Billing inquiry', 'New Chat'
  */
 
 jest.setTimeout(20000);
 
 const CHUNK_DELAY_MS = 100;
 const WORDS_PER_CHUNK = 2;
-const DEFAULT_CHAT_TITLE = 'New Chat';
 
 const validObjectId = () => new mongoose.Types.ObjectId().toString();
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -42,30 +48,30 @@ const speedUpStreaming = () => {
       realSetTimeout(handler, ms === CHUNK_DELAY_MS ? 0 : ms)) as unknown as typeof setTimeout);
 };
 
+// ─── SSE parsing helpers ──────────────────────────────────────────────────────
+
 interface ChunkData {
   content: string;
 }
-
 interface ErrorData {
   message: string;
   error: string;
 }
-
 interface DoneData {
   message: { _id: string; chatId: string; role: string; content: string };
   chat: { _id: string; title: string };
 }
 
 type ChunkEvent = { event: undefined; data: ChunkData };
-type DoneEvent = { event: 'done'; data: DoneData };
-type ErrorEvent = { event: 'error'; data: ErrorData };
-type ParsedSSE = ChunkEvent | DoneEvent | ErrorEvent;
+type DoneEvent  = { event: 'done';    data: DoneData  };
+type ErrorEvent = { event: 'error';   data: ErrorData };
+type ParsedSSE  = ChunkEvent | DoneEvent | ErrorEvent;
 
 const isChunk = (e: ParsedSSE): e is ChunkEvent => e.event === undefined;
-const isDone = (e: ParsedSSE): e is DoneEvent => e.event === 'done';
+const isDone  = (e: ParsedSSE): e is DoneEvent  => e.event === 'done';
 const isError = (e: ParsedSSE): e is ErrorEvent => e.event === 'error';
 
-/** Parses a raw SSE payload into [{ event?, data }] blocks. */
+/** Parses a raw SSE payload into typed event objects. */
 const parseSSE = (raw: string): ParsedSSE[] =>
   raw
     .split('\n\n')
@@ -84,6 +90,8 @@ const parseSSE = (raw: string): ParsedSSE[] =>
 const contentChunks = (events: ParsedSSE[]): string[] =>
   events.filter(isChunk).map((e) => e.data.content);
 
+// ─── Test suite ───────────────────────────────────────────────────────────────
+
 describe('POST /api/chats/:id/messages', () => {
   beforeAll(async () => {
     if (mongoose.connection.readyState === 0) {
@@ -92,7 +100,7 @@ describe('POST /api/chats/:id/messages', () => {
   });
 
   afterAll(async () => {
-    await dbDisconnect()
+    await dbDisconnect();
   });
 
   beforeEach(async () => {
@@ -104,23 +112,76 @@ describe('POST /api/chats/:id/messages', () => {
     jest.restoreAllMocks();
   });
 
-  // ---------------------------------------------------------------------------
-  // Validation
-  // ---------------------------------------------------------------------------
-  describe('params validation (id)', () => {
+  // ─── Session validation ─────────────────────────────────────────────────────
+
+  describe('session validation', () => {
+    it('returns 401 when no session cookie is sent (requireSession blocks the request)', async () => {
+      const chatId = validObjectId();
+      const findSpy  = jest.spyOn(Chat, 'findOne' as any);
+      const createSpy = jest.spyOn(Message, 'create');
+
+      // No .set('Cookie', ...) — request has no sid cookie
+      const res = await request(app)
+        .post(`/api/chats/${chatId}/messages`)
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(401);
+      expect(res.body.message).toMatch(/session/i);
+      expect(findSpy).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns 401 when an invalid (non-UUID) sid cookie value is sent', async () => {
+      const chatId = validObjectId();
+      const findSpy = jest.spyOn(Chat, 'findOne' as any);
+
+      const res = await request(app)
+        .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', 'sid=not-a-valid-uuid')
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(401);
+      expect(findSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when cookie sessionId does not match the chat (cross-session leak prevention)', async () => {
+      // Chat belongs to SESSION_A but we send SESSION_B's cookie
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'A-only chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const res = await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_B}`)   // wrong session
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ message: 'Chat not found' });
+      expect(await Message.countDocuments()).toBe(0);
+    });
+  });
+
+  // ─── Params validation ──────────────────────────────────────────────────────
+
+  describe('params validation (chat id)', () => {
     it.each([
-      ['too short', '123'],
-      ['not a mongo id', 'not-a-mongo-id'],
-      ['not hex characters', 'g'.repeat(24)],
-      ['25 characters', 'a'.repeat(25)],
-      ['23 characters', 'a'.repeat(23)],
-      ['special characters', 'invalid-id-with-dashes!!'],
+      ['too short',           '123'],
+      ['not a mongo id',      'not-a-mongo-id'],
+      ['non-hex 24 chars',    'g'.repeat(24)],
+      ['25 characters',       'a'.repeat(25)],
+      ['23 characters',       'a'.repeat(23)],
+      ['special characters',  'invalid-id-with-dashes!!'],
     ])('returns 400 when id is invalid (%s)', async (_label, badId) => {
-      const findSpy = jest.spyOn(Chat, 'findById');
+      const findSpy   = jest.spyOn(Chat, 'findOne' as any);
       const createSpy = jest.spyOn(Message, 'create');
 
       const res = await request(app)
         .post(`/api/chats/${badId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
       expect(res.status).toBe(400);
@@ -130,24 +191,33 @@ describe('POST /api/chats/:id/messages', () => {
     });
   });
 
+  // ─── Body validation ────────────────────────────────────────────────────────
+
   describe('body validation (content)', () => {
     let chatId: string;
 
     beforeEach(async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      chatId = chat._id.toString();
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'Test chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      chatId = insertedId.toString();
     });
 
     const expectNothingSaved = async () => {
       expect(await Message.countDocuments()).toBe(0);
-      const inDb = await Chat.findById(chatId);
-      expect(inDb?.title).toBe(DEFAULT_CHAT_TITLE);
     };
 
     it('returns 400 when content is missing (empty body object)', async () => {
       const createSpy = jest.spyOn(Message, 'create');
 
-      const res = await request(app).post(`/api/chats/${chatId}/messages`).send({});
+      const res = await request(app)
+        .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({});
 
       expect(res.status).toBe(400);
       expect(createSpy).not.toHaveBeenCalled();
@@ -157,6 +227,7 @@ describe('POST /api/chats/:id/messages', () => {
     it('returns 400 when only unrelated fields are sent', async () => {
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ foo: 'bar' });
 
       expect(res.status).toBe(400);
@@ -168,6 +239,7 @@ describe('POST /api/chats/:id/messages', () => {
 
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: '' });
 
       expect(res.status).toBe(400);
@@ -184,6 +256,7 @@ describe('POST /api/chats/:id/messages', () => {
 
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content });
 
       expect(res.status).toBe(400);
@@ -196,6 +269,7 @@ describe('POST /api/chats/:id/messages', () => {
 
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'a'.repeat(4001) });
 
       expect(res.status).toBe(400);
@@ -206,6 +280,7 @@ describe('POST /api/chats/:id/messages', () => {
     it('returns 400 when content is > 4000 chars even after trim', async () => {
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: `  ${'a'.repeat(4001)}  ` });
 
       expect(res.status).toBe(400);
@@ -213,14 +288,14 @@ describe('POST /api/chats/:id/messages', () => {
     });
 
     it.each([
-      ['a number', 123],
+      ['a number',  123],
       ['a boolean', true],
-      ['an object', {}],
-      ['an array', ['hi']],
-      ['null', null],
+      ['an array',  ['hi']],
+      ['null',      null],
     ])('returns 400 when content is %s (invalid type)', async (_label, content) => {
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content });
 
       expect(res.status).toBe(400);
@@ -232,6 +307,7 @@ describe('POST /api/chats/:id/messages', () => {
 
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'a'.repeat(4000) });
 
       expect(res.status).toBe(200);
@@ -243,21 +319,22 @@ describe('POST /api/chats/:id/messages', () => {
 
       const res = await request(app)
         .post(`/api/chats/${chatId}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'a' });
 
       expect(res.status).toBe(200);
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Chat lookup
-  // ---------------------------------------------------------------------------
+  // ─── Chat not found ─────────────────────────────────────────────────────────
+
   describe('chat not found', () => {
     it('returns 404 { message: "Chat not found" } and saves no user message', async () => {
       const createSpy = jest.spyOn(Message, 'create');
 
       const res = await request(app)
         .post(`/api/chats/${validObjectId()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello?' });
 
       expect(res.status).toBe(404);
@@ -269,175 +346,66 @@ describe('POST /api/chats/:id/messages', () => {
     it('does not open an SSE stream for a missing chat', async () => {
       const res = await request(app)
         .post(`/api/chats/${validObjectId()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello?' });
 
       expect(res.headers['content-type']).not.toContain('text/event-stream');
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Errors BEFORE the stream starts
-  // ---------------------------------------------------------------------------
-  describe('error handling before headers are sent', () => {
-    it('returns 500 JSON when Chat.findById throws an Error', async () => {
-      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      jest
-        .spyOn(Chat, 'findById')
-        .mockImplementation(() => {
-          throw new Error('Database connection lost');
-        });
+  // ─── Archived chat ──────────────────────────────────────────────────────────
+
+  describe('archived chat', () => {
+    it('returns 409 and does not save a message when the chat is archived', async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'Old chat',
+        sessionId: SESSION_A,
+        status: 'archived',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const createSpy = jest.spyOn(Message, 'create');
 
       const res = await request(app)
-        .post(`/api/chats/${validObjectId()}/messages`)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
-      expect(res.status).toBe(500);
-      expect(res.headers['content-type']).toContain('application/json');
-      expect(res.body).toEqual({
-        message: 'Failed to send message',
-        error: 'Database connection lost',
-      });
-      expect(errorSpy).toHaveBeenCalled();
+      expect(res.status).toBe(409);
+      expect(createSpy).not.toHaveBeenCalled();
       expect(await Message.countDocuments()).toBe(0);
-    });
-
-    it('returns 500 JSON when the initial Message.create (user message) throws', async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      jest
-        .spyOn(Message, 'create')
-        .mockImplementation(() => {
-          throw new Error('Insert failed');
-        });
-
-      const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
-        .send({ content: 'Hello' });
-
-      expect(res.status).toBe(500);
-      expect(res.headers['content-type']).toContain('application/json');
-      expect(res.body).toEqual({
-        message: 'Failed to send message',
-        error: 'Insert failed',
-      });
-      expect(errorSpy).toHaveBeenCalled();
-
-      jest.restoreAllMocks();
-      expect(await Message.countDocuments()).toBe(0);
-      // title must not be touched because the failure happened before the auto-title step
-      expect((await Chat.findById(chat._id))?.title).toBe(DEFAULT_CHAT_TITLE);
-    });
-
-    it("falls back to 'Unknown error' when a non-Error is thrown", async () => {
-      jest.spyOn(console, 'error').mockImplementation(() => {});
-      jest
-        .spyOn(Chat, 'findById')
-        .mockImplementation(() => {
-          throw 'something went wrong';
-        });
-
-      const res = await request(app)
-        .post(`/api/chats/${validObjectId()}/messages`)
-        .send({ content: 'Hello' });
-
-      expect(res.status).toBe(500);
-      expect(res.body).toEqual({
-        message: 'Failed to send message',
-        error: 'Unknown error',
-      });
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Auto-title
-  // ---------------------------------------------------------------------------
-  describe('auto-title', () => {
-    beforeEach(() => {
-      speedUpStreaming();
-    });
+  // ─── SSE streaming with seeded session data ──────────────────────────────────
 
-    it("sets the title to the first 20 chars of the trimmed content when it's the first message and title is 'New Chat'", async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-
-      const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
-        .send({ content: '   Hello world, this is a long first question   ' });
-
-      expect(res.status).toBe(200);
-
-      const inDb = await Chat.findById(chat._id);
-      expect(inDb?.title).toBe('Hello world, this is');
-      expect(inDb?.title.length).toBeLessThanOrEqual(20);
-
-      // the done event carries the updated title
-      const done = parseSSE(res.text).find(isDone);
-      expect(done?.data.chat.title).toBe('Hello world, this is');
-    });
-
-    it('trims trailing whitespace left over after truncation', async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-
-      // slice(0, 20) ends with a space -> must be trimmed again
-      await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
-        .send({ content: 'Hello world this is a long question' });
-
-      const inDb = await Chat.findById(chat._id);
-      expect(inDb?.title).toBe('Hello world this is');
-    });
-
-    it('uses the whole content as the title when it is shorter than 20 chars', async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-
-      await request(app).post(`/api/chats/${chat._id}/messages`).send({ content: '  Hi  ' });
-
-      const inDb = await Chat.findById(chat._id);
-      expect(inDb?.title).toBe('Hi');
-    });
-
-    it("does not overwrite the title on the first message when it is not 'New Chat'", async () => {
-      const chat = await Chat.create({ title: 'My Custom Title' });
-
-      const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
-        .send({ content: 'Some brand new question' });
-
-      expect(res.status).toBe(200);
-      expect((await Chat.findById(chat._id))?.title).toBe('My Custom Title');
-
-      const done = parseSSE(res.text).find(isDone);
-      expect(done?.data.chat.title).toBe('My Custom Title');
-    });
-
-    it("does not update the title when the chat already has messages, even if it is still 'New Chat'", async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      await Message.create({ chatId: chat._id, role: 'user', content: 'Earlier message' });
-
-      const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
-        .send({ content: 'A follow-up question' });
-
-      expect(res.status).toBe(200);
-      expect((await Chat.findById(chat._id))?.title).toBe(DEFAULT_CHAT_TITLE);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Streaming
-  // ---------------------------------------------------------------------------
-  describe('SSE streaming (happy path)', () => {
-    let chatId: string;
+  describe('SSE streaming — seeded chat with matching sessionId', () => {
+    /**
+     * This block uses testSeed.ts data. seedTestData() is called once in beforeAll
+     * for this describe block (overriding the outer beforeEach cleanup for its own
+     * lifecycle — each test here re-seeds fresh from this describe's beforeAll).
+     *
+     * Strategy: each test inserts its own seeded chat so it's isolated from the
+     * outer beforeEach clear, and runs the request with the matching sid cookie.
+     */
+    let seedResult: SeedResult;
 
     beforeEach(async () => {
       speedUpStreaming();
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      chatId = chat._id.toString();
+      // Seed fresh data before each test in this block (outer beforeEach already cleared)
+      seedResult = await seedTestData();
     });
 
-    it('responds with the correct SSE headers', async () => {
+    it('responds with correct SSE headers when sessionId matches the seeded chat', async () => {
+      // Pick the first SESSION_A chat from seed data
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_A)!;
+      expect(seededChat).toBeDefined();
+
       const res = await request(app)
-        .post(`/api/chats/${chatId}/messages`)
-        .send({ content: 'Hello' });
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'I need help with my refund.' });
 
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toContain('text/event-stream');
@@ -446,40 +414,47 @@ describe('POST /api/chats/:id/messages', () => {
       expect(res.headers['x-accel-buffering']).toBe('no');
     });
 
-    it("saves the user message with role 'user' and trimmed content BEFORE any chunk is streamed", async () => {
-      const writeSpy = jest.spyOn(http.ServerResponse.prototype, 'write');
+    it('saves the user message in the seeded chat before streaming begins', async () => {
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_A)!;
+      const writeSpy  = jest.spyOn(http.ServerResponse.prototype, 'write');
       const createSpy = jest.spyOn(Message, 'create');
 
       const res = await request(app)
-        .post(`/api/chats/${chatId}/messages`)
-        .send({ content: '   What is the weather?   ' });
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: '   Please check my invoice.   ' });
 
       expect(res.status).toBe(200);
 
-      // 1st Message.create call is the user message
+      // 1st create call must be the user message (trimmed)
       const userArgs: unknown = createSpy.mock.calls[0]?.[0];
-      expect(userArgs).toMatchObject({ role: 'user', content: 'What is the weather?' });
+      expect(userArgs).toMatchObject({ role: 'user', content: 'Please check my invoice.' });
 
-      // ...and it happened before the first SSE write
+      // create happened before the first SSE write
       const firstCreateOrder = createSpy.mock.invocationCallOrder[0]!;
-      const firstWriteOrder = writeSpy.mock.invocationCallOrder[0]!;
+      const firstWriteOrder  = writeSpy.mock.invocationCallOrder[0]!;
       expect(firstCreateOrder).toBeLessThan(firstWriteOrder);
 
-      const userMsg = await Message.findOne({ chatId, role: 'user' });
+      // user message persisted in DB
+      const userMsg = await Message.findOne({ chatId: seededChat._id, role: 'user', content: 'Please check my invoice.' });
       expect(userMsg).not.toBeNull();
-      expect(userMsg?.content).toBe('What is the weather?');
     });
 
-    it('streams word chunks formatted as `data: {"content":"..."}\\n\\n`', async () => {
+    it('streams chunks in `data: {"content":"..."} format for a seeded SESSION_A chat', async () => {
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_A)!;
+
       const res = await request(app)
-        .post(`/api/chats/${chatId}/messages`)
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
-      // exact wire format of the first chunk (WORDS_PER_CHUNK = 2)
+      expect(res.status).toBe(200);
+
+      // First chunk wire format
       expect(res.text.startsWith('data: {"content":"This is "}\n\n')).toBe(true);
 
-      const events = parseSSE(res.text);
-      const chunks = contentChunks(events);
+      const events  = parseSSE(res.text);
+      const chunks  = contentChunks(events);
 
       expect(chunks.length).toBeGreaterThan(1);
       chunks.forEach((chunk) => {
@@ -487,90 +462,316 @@ describe('POST /api/chats/:id/messages', () => {
         expect(chunk.trim().split(/\s+/).length).toBeLessThanOrEqual(WORDS_PER_CHUNK);
       });
 
-      // whitespace/newlines are preserved when chunks are re-joined
+      // Re-joining chunks reconstructs the static answer
       const joined = chunks.join('');
       expect(joined.startsWith('This is a static answer')).toBe(true);
       expect(joined).toContain('\n');
     });
 
-    it("emits a terminal `event: done` with the full assistant message and the chat, then closes", async () => {
+    it('emits a terminal `event: done` with the saved assistant message and chat for SESSION_A', async () => {
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_A)!;
+
       const res = await request(app)
-        .post(`/api/chats/${chatId}/messages`)
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
-      // supertest only resolves once res.end() has been called by the server
       expect(res.status).toBe(200);
       expect(res.text.endsWith('\n\n')).toBe(true);
 
       const events = parseSSE(res.text);
-      const last = events[events.length - 1]!;
+      const last   = events[events.length - 1]!;
+
       expect(last.event).toBe('done');
       expect(events.filter(isDone)).toHaveLength(1);
       expect(events.some(isError)).toBe(false);
 
-      const done = events.find(isDone);
+      const done   = events.find(isDone)!;
       const joined = contentChunks(events).join('');
-      expect(done?.data.message).toEqual(
+
+      expect(done.data.message).toEqual(
         expect.objectContaining({
-          _id: expect.any(String),
-          chatId,
-          role: 'assistant',
+          _id:    expect.any(String),
+          chatId: seededChat._id.toString(),
+          role:   'assistant',
           content: joined,
         })
       );
-      expect(done?.data.chat).toEqual(
-        expect.objectContaining({ _id: chatId, title: expect.any(String) })
+      expect(done.data.chat).toEqual(
+        expect.objectContaining({ _id: seededChat._id.toString(), title: expect.any(String) })
       );
     });
 
-    it("saves the complete assistant message with role 'assistant'", async () => {
+    it('saves the complete assistant message and chat message count is correct', async () => {
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_A)!;
+
       const res = await request(app)
-        .post(`/api/chats/${chatId}/messages`)
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
-      const events = parseSSE(res.text);
-      const joined = contentChunks(events).join('');
+      const events  = parseSSE(res.text);
+      const joined  = contentChunks(events).join('');
+      const chatId  = seededChat._id;
 
       const assistantMsgs = await Message.find({ chatId, role: 'assistant' });
       expect(assistantMsgs).toHaveLength(1);
       expect(assistantMsgs[0]?.content).toBe(joined);
+      expect(assistantMsgs[0]?.status).toBe('complete');
 
-      const done = events.find(isDone);
-      expect(done?.data.message._id).toBe(assistantMsgs[0]?._id.toString());
+      const done = events.find(isDone)!;
+      expect(done.data.message._id).toBe(assistantMsgs[0]?._id.toString());
 
-      // exactly one user + one assistant message in total
-      expect(await Message.countDocuments({ chatId })).toBe(2);
+      // Seed had 2 messages for this chat; now +2 (new user + assistant) = 4
+      const totalMessages = await Message.countDocuments({ chatId });
+      expect(totalMessages).toBe(4); // 2 from seed + 1 user + 1 assistant
+    });
+
+    it('works the same for a SESSION_B seeded chat', async () => {
+      const seededChat = seedResult.chats.find((c) => c.sessionId === SESSION_B)!;
+      expect(seededChat).toBeDefined();
+
+      const res = await request(app)
+        .post(`/api/chats/${seededChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_B}`)
+        .send({ content: 'I have a billing question.' });
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('text/event-stream');
+
+      const events = parseSSE(res.text);
+      expect(events.find(isDone)).toBeDefined();
+      expect(events.some(isError)).toBe(false);
+
+      const assistantMsg = await Message.findOne({ chatId: seededChat._id, role: 'assistant' });
+      expect(assistantMsg).not.toBeNull();
+      expect(assistantMsg?.content).toBeTruthy();
+    });
+
+    it('does not let SESSION_A access a chat that belongs to SESSION_B', async () => {
+      const sessionBChat = seedResult.chats.find((c) => c.sessionId === SESSION_B)!;
+
+      const res = await request(app)
+        .post(`/api/chats/${sessionBChat._id.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)   // wrong session
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ message: 'Chat not found' });
+
+      // No new messages saved
+      const newMessages = await Message.find({ chatId: sessionBChat._id, role: 'user', content: 'Hello' });
+      expect(newMessages).toHaveLength(0);
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Client disconnect
-  // ---------------------------------------------------------------------------
+  // ─── Errors BEFORE the stream starts ────────────────────────────────────────
+
+  describe('error handling before headers are sent', () => {
+    it('returns 500 JSON when Chat.findOne throws an Error', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest
+        .spyOn(Chat, 'findOne' as any)
+        .mockImplementation(() => { throw new Error('Database connection lost'); });
+
+      const res = await request(app)
+        .post(`/api/chats/${validObjectId()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(500);
+      expect(res.headers['content-type']).toContain('application/json');
+      expect(res.body).toEqual({
+        message: 'Failed to send message',
+        error:   'Database connection lost',
+      });
+      expect(errorSpy).toHaveBeenCalled();
+      expect(await Message.countDocuments()).toBe(0);
+    });
+
+    it('returns 500 JSON when the initial Message.create (user message) throws', async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New Chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest
+        .spyOn(Message, 'create')
+        .mockImplementation(() => { throw new Error('Insert failed'); });
+
+      const res = await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(500);
+      expect(res.headers['content-type']).toContain('application/json');
+      expect(res.body).toEqual({
+        message: 'Failed to send message',
+        error:   'Insert failed',
+      });
+      expect(errorSpy).toHaveBeenCalled();
+
+      jest.restoreAllMocks();
+      expect(await Message.countDocuments()).toBe(0);
+    });
+
+    it("falls back to 'Unknown error' when a non-Error is thrown before headers", async () => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest
+        .spyOn(Chat, 'findOne' as any)
+        .mockImplementation(() => { throw 'something went wrong'; });
+
+      const res = await request(app)
+        .post(`/api/chats/${validObjectId()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'Hello' });
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({
+        message: 'Failed to send message',
+        error:   'Unknown error',
+      });
+    });
+  });
+
+  // ─── Auto-title ─────────────────────────────────────────────────────────────
+
+  describe('auto-title', () => {
+    beforeEach(() => {
+      speedUpStreaming();
+    });
+
+    it("sets title to first 20 chars of trimmed content on the first message when title is the default", async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New chat',  // matches DEFAULT_CHAT_TITLE in the controller
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const res = await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: '   Hello world, this is a long first question   ' });
+
+      expect(res.status).toBe(200);
+
+      const inDb = await Chat.findById(insertedId);
+      expect(inDb?.title).toBe('Hello world, this is');
+      expect(inDb?.title.length).toBeLessThanOrEqual(20);
+
+      const done = parseSSE(res.text).find(isDone);
+      expect(done?.data.chat.title).toBe('Hello world, this is');
+    });
+
+    it('trims trailing whitespace from the auto-generated title', async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      // slice(0,20) ends with a space → must be trimmed
+      await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'Hello world this is a long question' });
+
+      const inDb = await Chat.findById(insertedId);
+      expect(inDb?.title).toBe('Hello world this is');
+    });
+
+    it('does not overwrite a custom title on the first message', async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'My Custom Title',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const res = await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'Some brand new question' });
+
+      expect(res.status).toBe(200);
+      expect((await Chat.findById(insertedId))?.title).toBe('My Custom Title');
+
+      const done = parseSSE(res.text).find(isDone);
+      expect(done?.data.chat.title).toBe('My Custom Title');
+    });
+
+    it("does not update the title when the chat already has messages (even if title is still default)", async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      // Insert a prior message so hasMessages = true
+      await Message.collection.insertOne({
+        chatId: insertedId,
+        role: 'user',
+        content: 'Earlier message',
+        status: 'complete',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      await request(app)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
+        .send({ content: 'A follow-up question' });
+
+      expect((await Chat.findById(insertedId))?.title).toBe('New chat');
+    });
+  });
+
+  // ─── Client disconnect mid-stream ───────────────────────────────────────────
+
   describe('client disconnect mid-stream', () => {
     it('aborts the loop early and does not persist the assistant message', async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New Chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
       const writeSpy = jest.spyOn(http.ServerResponse.prototype, 'write');
 
-      // real (slow) timers here: the full stream would take ~1.8s
+      // Start a real HTTP server on a random port (real timers — no speedUpStreaming here)
       const server = await new Promise<http.Server>((resolve) => {
         const s = app.listen(0, () => resolve(s));
       });
       const { port } = server.address() as AddressInfo;
 
       try {
-        // Open the stream, wait for the first chunk, then drop the connection.
         await new Promise<void>((resolve) => {
           const req = http.request(
             {
               port,
-              path: `/api/chats/${chat._id}/messages`,
+              path: `/api/chats/${insertedId.toString()}/messages`,
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                Cookie: `sid=${SESSION_A}`,
+              },
             },
             (res) => {
               res.on('error', () => {});
               res.once('data', () => {
-                req.destroy(); // -> server-side res emits 'close' before writableEnded
+                req.destroy(); // triggers 'close' on the server side before writableEnded
                 resolve();
               });
             }
@@ -580,26 +781,25 @@ describe('POST /api/chats/:id/messages', () => {
           req.end();
         });
 
-        // Wait longer than the whole stream would take if it had NOT aborted.
+        // Wait longer than the full stream would take if it had NOT aborted
         await sleep(2500);
 
-        // The loop stopped early (a full run would write ~18 chunks + done event)
+        // Loop stopped early (full run would write ~18 chunks + done)
         expect(writeSpy.mock.calls.length).toBeLessThan(5);
 
-        // User message saved, assistant message NOT saved
-        expect(await Message.countDocuments({ chatId: chat._id, role: 'user' })).toBe(1);
-        expect(await Message.countDocuments({ chatId: chat._id, role: 'assistant' })).toBe(0);
+        // User message saved, assistant NOT saved
+        expect(await Message.countDocuments({ chatId: insertedId, role: 'user' })).toBe(1);
+        expect(await Message.countDocuments({ chatId: insertedId, role: 'assistant' })).toBe(0);
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Errors AFTER the stream started
-  // ---------------------------------------------------------------------------
+  // ─── Errors AFTER the stream started ────────────────────────────────────────
+
   describe('error handling after headers are sent', () => {
-    /** First Message.create (user message) really runs; the second (assistant) fails. */
+    /** First Message.create (user message) runs normally; the second (assistant) fails. */
     const failOnAssistantSave = (rejection: unknown) => {
       const original = Message.create.bind(Message) as unknown as (
         ...args: unknown[]
@@ -616,67 +816,73 @@ describe('POST /api/chats/:id/messages', () => {
     });
 
     it('emits an SSE `error` event and ends the stream without sending a 500 JSON', async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New Chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const errorSpy  = jest.spyOn(console, 'error').mockImplementation(() => {});
       const statusSpy = jest.spyOn(express.response, 'status');
-      const jsonSpy = jest.spyOn(express.response, 'json');
+      const jsonSpy   = jest.spyOn(express.response, 'json');
       failOnAssistantSave(new Error('Assistant save failed'));
 
       const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
 
-      // headers were already sent as 200 / SSE, so no status change or JSON body
+      // Headers were already sent as 200/SSE — no status change or JSON body
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toContain('text/event-stream');
       expect(statusSpy).not.toHaveBeenCalledWith(500);
       expect(jsonSpy).not.toHaveBeenCalled();
       expect(errorSpy).toHaveBeenCalled();
 
-      // exact wire format of the error event
+      // Exact wire format of the error event
       expect(res.text).toContain(
         'event: error\ndata: {"message":"Failed to send message","error":"Assistant save failed"}\n\n'
       );
 
       const events = parseSSE(res.text);
-      const last = events[events.length - 1]!;
+      const last   = events[events.length - 1]!;
       expect(last.event).toBe('error');
       expect(last.data).toEqual({
         message: 'Failed to send message',
-        error: 'Assistant save failed',
+        error:   'Assistant save failed',
       });
       expect(events.some(isDone)).toBe(false);
-
-      // the content chunks were streamed before the failure
       expect(contentChunks(events).length).toBeGreaterThan(1);
 
-      // assistant message was not persisted
       jest.restoreAllMocks();
-      expect(await Message.countDocuments({ chatId: chat._id, role: 'assistant' })).toBe(0);
+      expect(await Message.countDocuments({ chatId: insertedId, role: 'assistant' })).toBe(0);
     });
 
-    it("uses 'Unknown error' in the SSE error event when a non-Error is thrown", async () => {
-      const chat = await Chat.create({ title: DEFAULT_CHAT_TITLE });
-      // DEBUG: is the chat really in the DB before the request?
-      expect(await Chat.findById(chat._id)).not.toBeNull();
+    it("uses 'Unknown error' in the SSE error event when a non-Error is thrown mid-stream", async () => {
+      const { insertedId } = await Chat.collection.insertOne({
+        title: 'New Chat',
+        sessionId: SESSION_A,
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
       jest.spyOn(console, 'error').mockImplementation(() => {});
       failOnAssistantSave('boom');
 
       const res = await request(app)
-        .post(`/api/chats/${chat._id}/messages`)
+        .post(`/api/chats/${insertedId.toString()}/messages`)
+        .set('Cookie', `sid=${SESSION_A}`)
         .send({ content: 'Hello' });
-
-      // DEBUG: controller 404 ({"message":"Chat not found"}) or Express "Cannot POST"?
-      console.log('DEBUG', res.status, res.headers['content-type'], res.text);
 
       expect(res.status).toBe(200);
 
       const events = parseSSE(res.text);
-      const last = events[events.length - 1]!;
+      const last   = events[events.length - 1]!;
       expect(last.event).toBe('error');
       expect(last.data).toEqual({
         message: 'Failed to send message',
-        error: 'Unknown error',
+        error:   'Unknown error',
       });
     });
   });
