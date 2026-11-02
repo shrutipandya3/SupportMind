@@ -1,5 +1,5 @@
 {
-  "name": "supportmind",
+  "name": "backend",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -19,6 +19,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/genai": "^2.32.0",
     "@types/cookie-parser": "^1.4.10",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
@@ -32,6 +33,7 @@
   },
   "devDependencies": {
     "@jest/globals": "^30.5.2",
+    "@jest/test-sequencer": "^30.5.2",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",

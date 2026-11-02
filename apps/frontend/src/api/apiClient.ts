@@ -1,33 +1,16 @@
 import axios from "axios";
-import type { 
-  AxiosError, 
-  AxiosInstance, 
-  AxiosRequestConfig, 
-  InternalAxiosRequestConfig 
-} from "axios";
+import type { AxiosError, AxiosInstance, AxiosRequestConfig } from "axios";
 
 export const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080/api";
-// For Create React App use: process.env.REACT_APP_API_BASE_URL
 
 const apiClient: AxiosInstance = axios.create({
   baseURL: BASE_URL,
   timeout: 15000,
+  withCredentials: true, // send/receive the httpOnly `sid` cookie cross-origin
   headers: {
     "Content-Type": "application/json",
   },
 });
-
-// ---------- Request interceptor: attach auth token ----------
-apiClient.interceptors.request.use(
-  (config: InternalAxiosRequestConfig) => {
-    const token = localStorage.getItem("token");
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
-    return config;
-  },
-  (error: AxiosError) => Promise.reject(error)
-);
 
 // ---------- Response interceptor: global error handling ----------
 apiClient.interceptors.response.use(

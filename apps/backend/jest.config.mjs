@@ -11,4 +11,5 @@ export default {
     '^.+\\.tsx?$': ['ts-jest', { useESM: true }],
   },
   testMatch: ['**/src/**/*.test.ts'],
+  testSequencer: './jest.sequencer.cjs',
 };

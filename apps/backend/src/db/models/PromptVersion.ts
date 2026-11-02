@@ -1,76 +1,19 @@
-import { Schema, model, type Document, type Model, type Types } from 'mongoose';
+// apps/backend/src/db/models/PromptVersion.ts
+import { Schema, model, type InferSchemaType } from "mongoose";
 
-export interface IPromptSettings {
-  temperature?: number;
-  maxTokens?: number;
-}
-
-export interface IPromptVersionObject {
-  _id: Types.ObjectId;
-  name: string;
-  version: number;
-  content: string;
-  settings?: IPromptSettings;
-  changeNote?: string;
-  isActive: boolean;
-  createdBy: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-  __v?: number;
-}
-
-export interface IPromptVersion extends Document {
-  name: string;
-  version: number;
-  content: string;
-  settings?: IPromptSettings;
-  changeNote?: string;
-  isActive: boolean;
-  createdBy: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const promptVersionSchema = new Schema<IPromptVersion>(
+const promptVersionSchema = new Schema(
   {
-    name: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    version: {
-      type: Number,
-      required: true,
-    },
-    content: {
-      type: String,
-      required: true,
-    },
-    settings: {
-      temperature: { type: Number },
-      maxTokens: { type: Number },
-    },
-    changeNote: {
-      type: String,
-    },
-    isActive: {
-      type: Boolean,
-      required: true,
-      default: false,
-    },
-    createdBy: {
-      type: Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-    },
+    name: { type: String, required: true, trim: true },
+    version: { type: Number, required: true, min: 1 },
+    text: { type: String, required: true },
+    contentHash: { type: String, required: true }, // sha256 hex
+    isActive: { type: Boolean, required: true, default: false },
+    createdAt: { type: Date, required: true, default: Date.now },
   },
-  {
-    timestamps: true,
-  }
+  { versionKey: false }
 );
 
-// Unique compound index on name and version
 promptVersionSchema.index({ name: 1, version: 1 }, { unique: true });
 
-export const PromptVersion: Model<IPromptVersion> = model<IPromptVersion>('PromptVersion', promptVersionSchema);
-export default PromptVersion;
+export type PromptVersionDoc = InferSchemaType<typeof promptVersionSchema>;
+export const PromptVersion = model("PromptVersion", promptVersionSchema);
